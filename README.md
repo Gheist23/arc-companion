@@ -1,6 +1,9 @@
 #  ARC Companion
 Advanced Tool for ARC Raiders
 
+# Download Installer
+https://mega.nz/file/gAM00Spa#iR37paY7aWJfapDN7kjd2quWVBDE
+
 # Support the Project here. Thank you!
 https://ko-fi.com/gheist79943
 
