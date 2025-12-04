@@ -53,8 +53,41 @@ from PySide6.QtWidgets import (
     QColorDialog,
 )
 
-SETTINGS_PATH = Path(__file__).with_name("arc_tooltip_settings.json")
-VERDICTS_PATH = Path(__file__).with_name("arc_tooltip_verdicts.json")
+
+# ---------- NEW: per-user config directory (no extra dependency) ----------
+
+def get_config_dir() -> Path:
+    """
+    Return a per-user configuration directory for ARC Companion.
+
+    Windows: %APPDATA%\\ARC_Companion
+    macOS:  ~/Library/Application Support/ARC_Companion
+    Linux:  $XDG_CONFIG_HOME/ARC_Companion or ~/.config/ARC_Companion
+    """
+    if sys.platform.startswith("win"):
+        base = os.getenv("APPDATA")
+        if not base:
+            base = str(Path.home())
+        return Path(base) / "ARC_Companion"
+    elif sys.platform == "darwin":
+        # macOS
+        return Path.home() / "Library" / "Application Support" / "ARC_Companion"
+    else:
+        # Linux / Unix
+        base = os.getenv("XDG_CONFIG_HOME")
+        if base:
+            return Path(base) / "ARC_Companion"
+        else:
+            return Path.home() / ".config" / "ARC_Companion"
+
+
+CONFIG_DIR = get_config_dir()
+CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+
+SETTINGS_PATH = CONFIG_DIR / "arc_tooltip_settings.json"
+VERDICTS_PATH = CONFIG_DIR / "arc_tooltip_verdicts.json"
+
+# ------------------------------------------------------------------------
 
 DEFAULT_SETTINGS = {
     "always_on": False,
@@ -328,7 +361,7 @@ class HotkeyCaptureDialog(QDialog):
 class SettingsWindow(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("ARC Advanced Tooltip")
+        self.setWindowTitle("ARC Companion")
         self.setWindowFlag(Qt.WindowContextHelpButtonHint, False)
 
         self._allow_close = False
@@ -353,7 +386,7 @@ class SettingsWindow(QMainWindow):
         main_layout.setSpacing(18)
 
         header_layout = QVBoxLayout()
-        title = QLabel("ARC Advanced Tooltip")
+        title = QLabel("ARC Companion")
         title.setStyleSheet("font-size: 20px; font-weight: 600;")
         subtitle = QLabel("Configure how the overlay is triggered while you play.")
         subtitle.setStyleSheet("color: #9aa0a6; font-size: 12px;")
@@ -936,8 +969,9 @@ class SettingsWindow(QMainWindow):
                 creationflags=creation_flags,
             )
         except Exception as e:
-            self.hotkey_edit.setText(f"Error starting helper: {e}")
-            self.helper_process = None
+            pass
+            # self.hotkey_edit.setText(f"Error starting helper: {e}")
+            # self.helper_process = None
 
 
 def create_dark_palette() -> QPalette:
@@ -1019,7 +1053,7 @@ def run_settings_ui():
     if icon.isNull():
         icon = app.style().standardIcon(QStyle.SP_ComputerIcon)
     tray.setIcon(icon)
-    tray.setToolTip("ARC Advanced Tooltip")
+    tray.setToolTip("ARC Companion")
 
     menu = QMenu()
     action_settings = QAction("Settings", menu)
@@ -1894,14 +1928,14 @@ REF_W = 1920
 REF_H = 1080
 
 NAME_REF_X = 15
-NAME_REF_Y = 95
+NAME_REF_Y = 54
 NAME_REF_W = 340
-NAME_REF_H = 30
+NAME_REF_H = 90
 
 NAME_REF_X2 = 15
-NAME_REF_Y2 = 45
+NAME_REF_Y2 = 4
 NAME_REF_W2 = 340
-NAME_REF_H2 = 30
+NAME_REF_H2 = 90
 
 HELPER_GAP_X_REF = 4
 HELPER_GAP_Y_REF = 46
@@ -1930,7 +1964,7 @@ def init_ocr():
         OCR_API = PyTessBaseAPI(
             path=TESSDATA_PATH,
             lang="eng",
-            psm=PSM.SINGLE_LINE,
+            psm=PSM.AUTO,
         )
         OCR_API.SetVariable(
             "tessedit_char_whitelist",
@@ -2087,13 +2121,19 @@ def convert_trailing_roman_numeral(name: str) -> str:
     return name
 
 
-def ocr_item_name(name_roi_bgr):
+def ocr_item_lines(name_roi_bgr) -> list[str]:
+    """
+    OCR the ROI and return a list of cleaned lines (top to bottom).
+    Each line keeps its own content so we can match individually
+    against the item DB.
+    """
     if name_roi_bgr is None or name_roi_bgr.size == 0:
-        return ""
+        return []
 
     init_ocr()
     global OCR_API
 
+    # Preprocess (same as before)
     gray = cv2.cvtColor(name_roi_bgr, cv2.COLOR_BGR2GRAY)
 
     target_h = 40
@@ -2107,11 +2147,39 @@ def ocr_item_name(name_roi_bgr):
     OCR_API.SetImage(pil_img)
     text = OCR_API.GetUTF8Text() or ""
 
-    text = " ".join(text.split())
+    lines: list[str] = []
+    for raw_line in text.splitlines():
+        # collapse internal whitespace and strip
+        line = " ".join(raw_line.split())
+        if not line:
+            continue
 
-    text = convert_trailing_roman_numeral(text)
+        # fix trailing roman numerals -> digits
+        line = convert_trailing_roman_numeral(line)
 
-    return text
+        lines.append(line)
+
+    return lines
+
+
+def ocr_item_name(name_roi_bgr) -> str:
+    """
+    Backward-compatible helper:
+    - OCR all lines
+    - Try to find a DB match for each line, in order
+    - Return the line that matches, or the longest line as a fallback
+    """
+    candidates = ocr_item_lines(name_roi_bgr)
+    if not candidates:
+        return ""
+
+    # Try each line against the DB, in order
+    for ln in candidates:
+        if find_item_row_by_name(ln) is not None:
+            return ln
+
+    # Fallback: just return the longest line
+    return max(candidates, key=len, default="")
 
 
 def compute_name_roi_hash(name_roi_bgr, diff_threshold=3.0, _cache={}):
@@ -2171,16 +2239,25 @@ def ocr_db_worker():
                 used_secondary = False
 
                 if roi_primary is not None:
-                    name = ocr_item_name(roi_primary)
-                    row = find_item_row_by_name(name) if name else None
+                    # Get all OCR lines, try each one against the DB
+                    primary_lines = ocr_item_lines(roi_primary)
+                    for ln in primary_lines:
+                        r = find_item_row_by_name(ln)
+                        if r is not None:
+                            name = ln
+                            row = r
+                            break
 
                 if (row is None) and (roi_secondary is not None):
-                    name2 = ocr_item_name(roi_secondary)
-                    row2 = find_item_row_by_name(name2) if name2 else None
-                    if row2 is not None:
-                        name = name2
-                        row = row2
-                        used_secondary = True
+                    # Fallback: try the secondary ROI (alt name area)
+                    secondary_lines = ocr_item_lines(roi_secondary)
+                    for ln in secondary_lines:
+                        r = find_item_row_by_name(ln)
+                        if r is not None:
+                            name = ln
+                            row = r
+                            used_secondary = True
+                            break
 
                 ocr_result_queue.put(
                     {
@@ -2295,7 +2372,6 @@ def parse_color_hex(value: str, default_rgba: tuple[int, int, int, int]) -> tupl
         return (r, g, b, a)
     except ValueError:
         return default_rgba
-
 
 
 def create_helper_tooltip_image(
